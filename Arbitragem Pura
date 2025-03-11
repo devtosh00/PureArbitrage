@@ -1,0 +1,534 @@
+import pandas as pd
+import numpy as np
+import os
+import logging
+import sys
+from datetime import datetime
+import plotly.graph_objects as go
+import plotly.express as px
+from plotly.subplots import make_subplots
+
+# Configuração do logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger('ArbitrageBacktest')
+
+class DataLoader:
+    """Classe responsável por carregar e processar os dados de spread."""
+    
+    def __init__(self, base_folder: str):
+        """Inicializa o carregador de dados."""
+        self.spread_file_path = os.path.join(base_folder, "dados_com_spread.csv")
+        
+    def load_and_process(self) -> pd.DataFrame:
+        """Carrega e processa os dados."""
+        try:
+            if not os.path.exists(self.spread_file_path):
+                raise FileNotFoundError(f"Arquivo não encontrado: {self.spread_file_path}")
+            
+            logger.info(f"📂 Carregando arquivo: {self.spread_file_path}")
+            df_spread = pd.read_csv(self.spread_file_path, parse_dates=["Timestamp"])
+            
+            # Verificar se colunas necessárias existem
+            required_columns = ['Timestamp', 'close_x', 'close_y', 'spread', 'transation_cost', 'businessday']
+            for col in required_columns:
+                if col not in df_spread.columns:
+                    raise ValueError(f"Coluna '{col}' não encontrada no CSV de spread!")
+            
+            # Processamento do spread
+            df_spread.set_index('Timestamp', inplace=True)
+            df_spread.sort_index(inplace=True)
+            
+            # Inicializar colunas financeiras
+            df_spread["cash"] = 100000.0
+            df_spread["portfolio_value"] = 100000.0
+            
+            logger.info(f"✅ Dados carregados: {len(df_spread)} registros de {df_spread.index.min()} a {df_spread.index.max()}")
+            return df_spread
+
+        except Exception as e:
+            logger.error(f"❌ Erro ao carregar dados: {e}")
+            return pd.DataFrame()
+
+
+class ArbitrageBacktest:
+    """Classe para backtest de arbitragem entre PAXG e XAUUSD."""
+    
+    def __init__(self, df, initial_capital=100000.0, allocation_fraction=0.20):
+        """
+        Inicializa o backtest de arbitragem.
+        
+        Args:
+            df: DataFrame com dados de preço e spread
+            initial_capital: Capital inicial para o backtest
+            allocation_fraction: Fração do capital a ser alocada em cada oportunidade
+        """
+        self.df = df.copy()
+        self.initial_capital = initial_capital
+        self.allocation_fraction = allocation_fraction
+        self.trades = []
+        self.total_trades = 0
+        self.profitable_trades = 0
+    
+    def run_backtest(self):
+        """Executa o backtest da estratégia de arbitragem pura."""
+        if self.df.empty:
+            logger.warning("DataFrame vazio. Não há dados para backtest.")
+            return
+        
+        logger.info(f"Iniciando backtest com {len(self.df)} períodos...")
+        
+        # Inicializando colunas de resultado
+        self.df["cash"] = self.initial_capital
+        self.df["portfolio_value"] = self.initial_capital
+        self.df["trade_signal"] = 0
+        self.df["trade_profit"] = 0.0
+        self.df["daily_return"] = 0.0
+        self.df["allocation"] = 0.0  # Registra quanto do portfólio foi alocado em cada trade
+        self.df["potential_profit"] = 0.0  # Lucro teórico da arbitragem (para análise)
+        self.df["spread_pct"] = (self.df["spread"] - 1) * 100  # Spread como percentual
+        
+        # Executando o backtest período a período
+        for i in range(1, len(self.df)):
+            idx_prev, idx_curr = self.df.index[i-1], self.df.index[i]
+            
+            # Obtém valores do período atual
+            row = self.df.loc[idx_curr]
+            price_paxg = row["close_x"]
+            price_xauusd = row["close_y"]
+            spread = row["spread"]
+            transaction_cost = row["transation_cost"]
+            business_day = row["businessday"]
+            
+            # Obtém valores do período anterior
+            cash_prev = self.df.at[idx_prev, "cash"]
+            
+            # Atualiza cash (sem juros para simplificar)
+            cash_new = cash_prev
+            
+            # Calcula o lucro teórico por unidade para este spread (análise)
+            potential_profit_pct = spread - 1 - transaction_cost / price_paxg
+            self.df.at[idx_curr, "potential_profit"] = potential_profit_pct * 100  # Em percentual
+            
+            # Verifica oportunidade de arbitragem:
+            # 1. Se XAUUSD está mais caro que PAXG (spread > 1)
+            # 2. E se a diferença é maior que o custo de transação
+            # 3. E estamos em um dia útil (businessday = 1)
+            if spread > (1 + transaction_cost/price_paxg) and business_day == 1:
+                # Calcula o valor a ser investido - usa uma fração do capital
+                invest_amount = cash_new * self.allocation_fraction
+                
+                if invest_amount > 0:
+                    # Calcula a quantidade a ser negociada
+                    quantity = invest_amount / price_paxg
+                    
+                    # Operação completa de arbitragem
+                    paxg_cost = quantity * price_paxg
+                    xauusd_revenue = quantity * price_xauusd
+                    
+                    # Lucro líquido considerando o custo de transação
+                    profit = xauusd_revenue - paxg_cost - transaction_cost
+                    
+                    if profit > 0:
+                        # Calcula percentual de alocação do portfólio
+                        allocation_pct = (paxg_cost / cash_new) * 100
+                        
+                        # Atualiza cash
+                        cash_new = cash_new - paxg_cost + xauusd_revenue - transaction_cost
+                        
+                        # Registra trade
+                        self.trades.append({
+                            "timestamp": idx_curr,
+                            "price_paxg": price_paxg,
+                            "price_xauusd": price_xauusd,
+                            "quantidade": quantity,
+                            "spread": spread,
+                            "spread_pct": (spread - 1) * 100,  # Spread em %
+                            "profit": profit,
+                            "profit_pct": (profit / paxg_cost) * 100,  # Lucro em %
+                            "allocation": allocation_pct,  # % do portfólio alocado
+                            "transaction_cost": transaction_cost
+                        })
+                        
+                        # Atualiza métricas
+                        self.total_trades += 1
+                        self.profitable_trades += 1
+                        
+                        # Sinaliza trade
+                        self.df.at[idx_curr, "trade_signal"] = 1
+                        self.df.at[idx_curr, "trade_profit"] = profit
+                        self.df.at[idx_curr, "allocation"] = allocation_pct
+            
+            # Atualiza o valor do portfólio
+            self.df.at[idx_curr, "cash"] = cash_new
+            self.df.at[idx_curr, "portfolio_value"] = cash_new
+            
+            # Calcula o retorno diário
+            self.df.at[idx_curr, "daily_return"] = (cash_new / self.df.at[idx_prev, "portfolio_value"]) - 1
+        
+        # Calcula o retorno acumulado
+        self.df["cumulative_return"] = (1 + self.df["daily_return"]).cumprod() - 1
+        
+        # Calcula retorno total e outras métricas
+        final_value = self.df["portfolio_value"].iloc[-1]
+        total_return = (final_value / self.initial_capital - 1) * 100
+        logger.info(f"✅ Backtest concluído: {self.total_trades} trades, {total_return:.2f}% retorno total")
+    
+    # Modificação na função plot_interactive_results para adicionar exportação em PNG e PDF
+
+    def plot_simple_results(self, save_folder=None):
+        """Gera gráficos simplificados e mais fáceis de entender."""
+        if self.df.empty or "portfolio_value" not in self.df.columns:
+            logger.error("Não há dados para gerar gráficos.")
+            return
+        
+        # Verifica/cria pasta para salvar resultados
+        if save_folder:
+            os.makedirs(save_folder, exist_ok=True)
+        
+        # Criar um dataframe com os dados de trades para melhor visualização
+        trades_df = self.df[self.df["trade_signal"] == 1].copy()
+        
+        # ================ GRÁFICO 1: EVOLUÇÃO DO CAPITAL ================
+        fig = make_subplots(rows=2, cols=1, 
+                            row_heights=[0.7, 0.3], 
+                            shared_xaxes=True,
+                            vertical_spacing=0.1,
+                            subplot_titles=("Evolução do Capital", "Retorno Acumulado (%)"))
+        
+        # Gráfico Superior: Evolução do capital
+        fig.add_trace(
+            go.Scatter(
+                x=self.df.index,
+                y=self.df["portfolio_value"],
+                mode="lines",
+                name="Valor do Portfólio",
+                line=dict(color="blue", width=2),
+                hovertemplate="<b>Data:</b> %{x|%d/%m/%Y}<br><b>Valor:</b> $%{y:.2f}<extra></extra>"
+            ),
+            row=1, col=1
+        )
+        
+        # Adicionar pontos de trade no gráfico superior
+        if len(trades_df) > 0:
+            fig.add_trace(
+                go.Scatter(
+                    x=trades_df.index,
+                    y=trades_df["portfolio_value"],
+                    mode="markers",
+                    name="Operações",
+                    marker=dict(
+                        symbol="triangle-up",
+                        size=10,
+                        color="green",
+                    ),
+                    hovertemplate="<b>Data:</b> %{x|%d/%m/%Y}<br><b>Valor:</b> $%{y:.2f}<br><b>Lucro:</b> $%{customdata:.2f}<extra></extra>",
+                    customdata=trades_df["trade_profit"]
+                ),
+                row=1, col=1
+            )
+        
+        # Gráfico inferior: Retorno Acumulado (%)
+        fig.add_trace(
+            go.Scatter(
+                x=self.df.index,
+                y=self.df["cumulative_return"] * 100,
+                mode="lines",
+                name="Retorno Acumulado",
+                line=dict(color="green", width=2),
+                hovertemplate="<b>Data:</b> %{x|%d/%m/%Y}<br><b>Retorno:</b> %{y:.2f}%<extra></extra>"
+            ),
+            row=2, col=1
+        )
+        
+        # Layout geral
+        fig.update_layout(
+            height=700,
+            width=1000,
+            template="simple_white",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
+            hovermode="x unified"
+        )
+        
+        # Adicionar linha zero no gráfico de retorno
+        fig.add_shape(
+            type="line",
+            x0=self.df.index.min(),
+            y0=0,
+            x1=self.df.index.max(),
+            y1=0,
+            line=dict(color="gray", dash="dot"),
+            row=2, col=1
+        )
+        
+        # Adicionar controles de tempo
+        fig.update_xaxes(
+            rangeselector=dict(
+                buttons=list([
+                    dict(count=7, label="7d", step="day", stepmode="backward"),
+                    dict(count=1, label="1m", step="month", stepmode="backward"),
+                    dict(count=3, label="3m", step="month", stepmode="backward"),
+                    dict(step="all")
+                ])
+            ),
+            row=2, col=1
+        )
+        
+        # Formatação final
+        fig.update_xaxes(title_text="Data", tickformat="%d/%m/%Y", row=2, col=1)
+        fig.update_yaxes(title_text="Valor do Portfólio ($)", row=1, col=1)
+        fig.update_yaxes(title_text="Retorno (%)", row=2, col=1)
+        
+        # Salvar gráfico
+        if save_folder:
+            html_file = os.path.join(save_folder, "01_evolucao_capital.html")
+            fig.write_html(html_file)
+            
+            png_file = os.path.join(save_folder, "01_evolucao_capital.png")
+            fig.write_image(png_file, scale=2)
+            
+            logger.info(f"Gráfico de evolução do capital salvo em {save_folder}")
+        
+        # ================ GRÁFICO 2: SPREAD E OPERAÇÕES ================
+        fig2 = go.Figure()
+    
+        # Linha de spread
+        fig2.add_trace(
+            go.Scatter(
+                x=self.df.index,
+                y=self.df["spread_pct"],
+                mode="lines",
+                name="Spread (%)",
+                line=dict(color="blue", width=1),
+                hovertemplate="<b>Data:</b> %{x|%d/%m/%Y}<br><b>Spread:</b> %{y:.4f}%<extra></extra>"
+            )
+        )
+        
+        # Calcular o custo de transação médio como percentual do preço
+        trans_cost = self.df["transation_cost"].mean() * 100 / self.df["close_x"].mean()
+        
+        # Linha de custo (versão sem anotação embutida)
+        fig2.add_hline(
+            y=trans_cost,
+            line=dict(color="red", dash="dash", width=1.5)
+        )
+
+        # Adicionar a anotação separadamente
+        fig2.add_annotation(
+            text=f"Custo ({trans_cost:.4f}%)",
+            font=dict(color="red"),
+            xref="paper", yref="y",
+            x=0.01, y=trans_cost+0.01,
+            showarrow=False
+        )
+        
+        # Pontos de operação
+        if len(trades_df) > 0:
+            fig2.add_trace(
+                go.Scatter(
+                    x=trades_df.index,
+                    y=trades_df["spread_pct"],
+                    mode="markers",
+                    name="Operações",
+                    marker=dict(
+                        symbol="triangle-up",
+                        size=10,
+                        color="green",
+                    ),
+                    hovertemplate="<b>Data:</b> %{x|%d/%m/%Y}<br><b>Spread:</b> %{y:.4f}%<br><b>Alocação:</b> %{customdata:.2f}%<extra></extra>",
+                    customdata=trades_df["allocation"]
+                )
+            )
+        
+        # Layout
+        fig2.update_layout(
+            title="Spread PAXG/XAUUSD e Oportunidades de Arbitragem",
+            xaxis_title="Data",
+            yaxis_title="Spread (%)",
+            height=500,
+            width=1000,
+            template="simple_white",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
+            hovermode="x unified"
+        )
+        
+        # Adicionar controles de tempo
+        fig2.update_xaxes(
+            rangeselector=dict(
+                buttons=list([
+                    dict(count=7, label="7d", step="day", stepmode="backward"),
+                    dict(count=1, label="1m", step="month", stepmode="backward"),
+                    dict(count=3, label="3m", step="month", stepmode="backward"),
+                    dict(step="all")
+                ])
+            ),
+            tickformat="%d/%m/%Y"
+        )
+        
+        # Salvar gráfico
+        if save_folder:
+            html_file = os.path.join(save_folder, "02_spread.html")
+            fig2.write_html(html_file)
+            
+            png_file = os.path.join(save_folder, "02_spread.png")
+            fig2.write_image(png_file, scale=2)
+            
+            logger.info(f"Gráfico de spread salvo em {save_folder}")
+        
+        # ================ GRÁFICO 3: LUCROS DAS OPERAÇÕES ================
+        if self.total_trades > 0:
+            # Preparar dados
+            trades_data = pd.DataFrame(self.trades)
+            trades_data.set_index("timestamp", inplace=True)
+            trades_data.sort_index(inplace=True)
+            trades_data["cumulative_profit"] = trades_data["profit"].cumsum()
+            
+            fig3 = go.Figure()
+            
+            # Barras de lucro por operação
+            fig3.add_trace(
+                go.Bar(
+                    x=trades_data.index,
+                    y=trades_data["profit"],
+                    name="Lucro por Operação",
+                    marker_color="green",
+                    hovertemplate="<b>Data:</b> %{x|%d/%m/%Y}<br><b>Lucro:</b> $%{y:.2f}<extra></extra>"
+                )
+            )
+            
+            # Linha de lucro acumulado
+            fig3.add_trace(
+                go.Scatter(
+                    x=trades_data.index,
+                    y=trades_data["cumulative_profit"],
+                    mode="lines+markers",
+                    name="Lucro Acumulado",
+                    line=dict(color="blue", width=2),
+                    hovertemplate="<b>Data:</b> %{x|%d/%m/%Y}<br><b>Lucro Acumulado:</b> $%{y:.2f}<extra></extra>"
+                )
+            )
+            
+            # Layout
+            fig3.update_layout(
+                title="Resultados das Operações de Arbitragem",
+                xaxis_title="Data",
+                yaxis_title="Valor ($)",
+                height=500,
+                width=1000,
+                template="simple_white",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
+                hovermode="x unified"
+            )
+            
+            # Formatação do eixo x
+            fig3.update_xaxes(tickformat="%d/%m/%Y")
+            
+            # Salvar gráfico
+            if save_folder:
+                html_file = os.path.join(save_folder, "03_lucros.html")
+                fig3.write_html(html_file)
+                
+                png_file = os.path.join(save_folder, "03_lucros.png")
+                fig3.write_image(png_file, scale=2)
+                
+                logger.info(f"Gráfico de lucros salvo em {save_folder}")
+        
+        # Mostrar gráficos ou informar usuário
+        if save_folder:
+            logger.info("Gráficos simplificados foram gerados e salvos")
+        else:
+            from IPython.display import display
+            display(fig)
+            display(fig2)
+            if self.total_trades > 0:
+                display(fig3)
+    
+    def get_metrics(self):
+        """Retorna métricas simplificadas de desempenho."""
+        if self.df.empty:
+            return {"error": "Sem dados para análise"}
+        
+        # Métricas básicas
+        final_value = self.df["portfolio_value"].iloc[-1]
+        total_return = (final_value / self.initial_capital - 1) * 100
+        
+        # Métricas de trade
+        avg_profit = self.df[self.df["trade_profit"] > 0]["trade_profit"].mean()
+        total_profit = self.df["trade_profit"].sum()
+        
+        # Métricas de alocação
+        avg_allocation = self.df[self.df["allocation"] > 0]["allocation"].mean()
+        max_allocation = self.df["allocation"].max()
+        
+        # Métricas de spread
+        avg_trade_spread = 0
+        if self.total_trades > 0:
+            avg_trade_spread = np.mean([t["spread_pct"] for t in self.trades])
+        
+        # Métricas de oportunidade
+        total_days = len(self.df)
+        days_with_trades = len(self.df[self.df["trade_signal"] == 1])
+        opportunity_rate = (days_with_trades / total_days) * 100
+        
+        # Período analisado
+        start_date = self.df.index.min().strftime('%d/%m/%Y')
+        end_date = self.df.index.max().strftime('%d/%m/%Y')
+        
+        return {
+            "Capital Inicial": f"${self.initial_capital:,.2f}",
+            "Capital Final": f"${final_value:,.2f}",
+            "Retorno Total": f"{total_return:.2f}%",
+            "Número de Operações": self.total_trades,
+            "Taxa de Sucesso": "100%" if self.total_trades > 0 else "N/A",
+            "Lucro Total": f"${total_profit:,.2f}",
+            "Lucro Médio por Operação": f"${avg_profit:,.2f}" if self.total_trades > 0 else "N/A",
+            "Spread Médio nas Operações": f"{avg_trade_spread:.4f}%" if self.total_trades > 0 else "N/A",
+            "Alocação Média por Trade": f"{avg_allocation:.2f}%" if self.total_trades > 0 else "N/A",
+            "Alocação Máxima": f"{max_allocation:.2f}%" if self.total_trades > 0 else "N/A",
+            "Taxa de Oportunidade": f"{opportunity_rate:.2f}%",
+            "Período Analisado": f"{start_date} a {end_date}"
+        }
+
+
+# Função principal
+if __name__ == "__main__":
+    # Definir pasta base com arquivos de dados
+    base_folder = r"C:\Users\Toshi\Downloads\Documents\Testes_H2\bases"
+    
+    # Criar pasta para resultados
+    results_folder = os.path.join(os.path.dirname(base_folder), "resultados")
+    os.makedirs(results_folder, exist_ok=True)
+    
+    # Carregar dados
+    logger.info("Carregando dados...")
+    df = DataLoader(base_folder).load_and_process()
+    
+    if df.empty:
+        logger.error("DataFrame vazio. Verifique os arquivos CSV.")
+        sys.exit(1)
+    
+    # Executar backtest
+    logger.info("Executando backtest de arbitragem pura...")
+    backtest = ArbitrageBacktest(df, initial_capital=100000.0, allocation_fraction=0.30)
+    backtest.run_backtest()
+    
+    # Mostrar métricas simplificadas
+    metrics = backtest.get_metrics()
+    logger.info("\n===== RESULTADO DA ESTRATÉGIA =====")
+    for key, value in metrics.items():
+        logger.info(f"{key}: {value}")
+    
+    # Gerar gráficos simplificados (correção: usando o método existente)
+    backtest.plot_simple_results(save_folder=results_folder)
+    
+    # Salvar resultados
+    results_file = os.path.join(results_folder, "arbitrage_resultados.csv")
+    trades_file = os.path.join(results_folder, "arbitrage_trades.csv")
+    
+    df.to_csv(results_file)
+    pd.DataFrame(backtest.trades).to_csv(trades_file, index=False)
+    
+    logger.info(f"Backtest concluído! Resultados salvos em '{results_folder}'")
